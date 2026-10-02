@@ -34,7 +34,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Bump this whenever the public plugin API or any event layout changes in a way
 /// that makes old binary plugins incompatible.
-pub const PLUGIN_API_VERSION: u32 = 2;
+pub const PLUGIN_API_VERSION: u32 = 3;
 
 const PLUGIN_DIR: &str = "./plugins";
 
@@ -399,6 +399,13 @@ impl PluginManager {
 
         // Wait for all retry tasks to complete
         join_all(retry_tasks).await;
+    }
+
+    #[must_use]
+    pub fn is_guest_call_active(&self) -> bool {
+        self.loaders.try_read().map_or(true, |loaders| {
+            loaders.iter().any(|loader| loader.is_guest_call_active())
+        })
     }
 
     /// Lets every loader run its per-tick work.

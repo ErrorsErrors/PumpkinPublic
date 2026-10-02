@@ -133,6 +133,9 @@ pub use wit::pumpkin::plugin::{
     text, uuid, world,
 };
 
+#[cfg(feature = "api-v0-2")]
+pub use wit::pumpkin::plugin::user::{self, User, UserInfo};
+
 // Convenience re-exports of commonly-used plugin types so plugin authors can
 // name them directly (e.g. build an `ItemStack` for a GUI or `/give`).
 pub use block::{BlockStateTypeExt, BlockType, BlockTypeExt, IntoBlockKey};
@@ -202,6 +205,7 @@ pub mod logging;
 
 #[allow(clippy::too_many_arguments, missing_docs)]
 pub mod wit {
+    #[cfg(not(feature = "api-v0-2"))]
     wit_bindgen::generate!({
         skip: ["init-plugin"],
         path: "../pumpkin-plugin-wit/v0.1",
@@ -210,6 +214,18 @@ pub mod wit {
             "pumpkin:plugin/command@0.1.0#command",
             "pumpkin:plugin/command@0.1.0#command-node",
             "pumpkin:plugin/text@0.1.0#text-component"
+        ]
+    });
+
+    #[cfg(feature = "api-v0-2")]
+    wit_bindgen::generate!({
+        skip: ["init-plugin"],
+        path: "../pumpkin-plugin-wit/v0.2",
+        world: "plugin",
+        chainable_methods: [
+            "pumpkin:plugin/command@0.2.0#command",
+            "pumpkin:plugin/command@0.2.0#command-node",
+            "pumpkin:plugin/text@0.2.0#text-component"
         ]
     });
 

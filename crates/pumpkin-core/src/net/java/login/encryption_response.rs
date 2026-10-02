@@ -1,5 +1,7 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use crate::net::can_not_join;
+use pumpkin_protocol::packet::MultiVersionJavaPacket;
 
 impl PendingConnection {
     async fn verify_encryption_token(
@@ -130,7 +132,6 @@ impl PendingConnection {
             pumpkin_protocol::codec::var_int::VarInt(compression.threshold as i32),
         ))
         .await;
-        self.set_compression(&compression);
     }
 
     pub(super) async fn finish_login(
@@ -163,8 +164,26 @@ impl PendingConnection {
             false,
             uuid::Uuid::new_v4(),
         );
-        self.send_packet_now(&packet).await;
-        None
+        let Some(sent) = self.send_packet_checked(&packet).await else {
+            return self.is_closed().then_some(PacketHandlerResult::Stop);
+        };
+        if self.is_closed() {
+            return Some(PacketHandlerResult::Stop);
+        }
+        if sent.id != CLoginSuccess::to_id(self.version.load()) {
+            return None;
+        }
+        if self.version.load().supports_configuration_state() {
+            return None;
+        }
+
+        self.connection_state.store(ConnectionState::Play);
+        let config = self.config.clone().unwrap_or_default();
+        if let Some(reason) = can_not_join(profile, &self.address, server).await {
+            self.kick(reason).await;
+            return Some(PacketHandlerResult::Stop);
+        }
+        Some(PacketHandlerResult::ReadyToPlay(profile.clone(), config))
     }
 
     async fn authenticate(

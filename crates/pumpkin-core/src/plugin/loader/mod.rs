@@ -41,6 +41,10 @@ pub trait PluginLoader: Send + Sync {
 
     /// Called once per server tick for loaders that run work of their own, like scheduled plugin tasks.
     fn on_tick(&self, _server: &Arc<Server>) {}
+
+    fn is_guest_call_active(&self) -> bool {
+        false
+    }
 }
 
 /// Unified loader error type

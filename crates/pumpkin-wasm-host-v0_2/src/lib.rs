@@ -67,6 +67,7 @@ pub mod status_effect;
 #[allow(clippy::unused_async_trait_impl)]
 pub mod text;
 #[allow(clippy::unused_async_trait_impl)]
+pub mod user;
 pub mod uuid;
 #[allow(clippy::unused_async_trait_impl)]
 pub mod world;
@@ -99,6 +100,9 @@ mod resource_with {
     }
     impl FromResource for plugin::context::Context {
         type Internal = Arc<Context>;
+    }
+    impl FromResource for plugin::user::User {
+        type Internal = Arc<pumpkin_core::net::user::User>;
     }
     impl FromResource for plugin::player::Player {
         type Internal = Arc<Player>;

@@ -22,7 +22,8 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::net::decrement_pending_bytes;
+pub(super) use crate::net::user::{Completion, OutgoingPacket};
+use crate::net::{decrement_pending_bytes, user::User};
 
 /// Max wait for the disconnect flush (`kick_explicit`, writer drain on close).
 pub const DISCONNECT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -58,60 +59,34 @@ impl FlushRequest {
     }
 }
 
-pub enum Completion {
-    /// After `write_frame` into the `BufWriter`.
-    Framed(oneshot::Sender<()>),
-    /// After the TCP flush. Disconnect: `close()` follows, so the flush must be done.
-    /// Flushes also while suspended, else a kick awaited inside the tick waits on its own barrier.
-    Flushed(oneshot::Sender<()>),
-}
-
-pub enum OutgoingPacket {
-    Data {
-        data: Bytes,
-        completion: Option<Completion>,
-    },
-    /// End-of-tick barrier (`Connection.flushChannel`).
-    Flush,
-}
-
 struct FramePacket {
     data: Bytes,
     completion: Option<Completion>,
+    state: Option<pumpkin_protocol::ConnectionState>,
+    silent: bool,
 }
 
 impl OutgoingPacket {
-    pub const fn normal(data: Bytes) -> Self {
-        Self::Data {
-            data,
-            completion: None,
-        }
-    }
-
-    pub const fn high_priority(data: Bytes, completion: oneshot::Sender<()>) -> Self {
-        Self::Data {
-            data,
-            completion: Some(Completion::Framed(completion)),
-        }
-    }
-
-    pub const fn flushed(data: Bytes, completion: oneshot::Sender<()>) -> Self {
-        Self::Data {
-            data,
-            completion: Some(Completion::Flushed(completion)),
-        }
-    }
-
     fn ingest(self, flush_request: &mut FlushRequest, packets: &mut VecDeque<FramePacket>) {
         match self {
             Self::Flush => *flush_request = flush_request.merge(FlushRequest::Always),
-            Self::Data { data, completion } => {
+            Self::Data {
+                data,
+                state,
+                silent,
+                completion,
+            } => {
                 *flush_request = flush_request.merge(match completion {
                     Some(Completion::Flushed(_)) => FlushRequest::Always,
                     // off-tick sends flush at once -> mid-tick ones wait for `Flush`.
                     Some(Completion::Framed(_)) | None => FlushRequest::IfNotSuspended,
                 });
-                packets.push_back(FramePacket { data, completion });
+                packets.push_back(FramePacket {
+                    data,
+                    completion,
+                    state,
+                    silent,
+                });
             }
         }
     }
@@ -186,6 +161,7 @@ struct WriterCtx {
     suspend_flushing: Arc<AtomicBool>,
     pending_bytes: Arc<AtomicUsize>,
     id: u64,
+    user: Option<Arc<User>>,
 }
 
 /// Reason flush left the writer loop.
@@ -346,7 +322,41 @@ async fn write_queued_frames<W: AsyncWrite + Unpin + Send + 'static>(
 ) -> Option<TCPNetworkEncoder<W>> {
     let (close_token, id) = (&ctx.close_token, ctx.id);
     while !packets_to_frame.is_empty() {
-        let frame_batch = take_frame_batch(&mut packets_to_frame);
+        let mut frame_batch = take_frame_batch(&mut packets_to_frame);
+        if let Some(user) = &ctx.user {
+            let mut filtered = Vec::with_capacity(frame_batch.len());
+            for mut packet in frame_batch {
+                let original_len = packet.data.len();
+                if let Some(data) =
+                    super::filter_outgoing_packet(user, packet.data, packet.silent, packet.state)
+                        .await
+                {
+                    let filtered_len = data.len();
+                    if filtered_len > original_len {
+                        let extra = filtered_len - original_len;
+                        let previous = ctx.pending_bytes.fetch_add(extra, Ordering::AcqRel);
+                        if previous.saturating_add(extra) > crate::net::MAX_PENDING_BYTES {
+                            decrement_pending_bytes(&ctx.pending_bytes, extra);
+                            user.close();
+                            return None;
+                        }
+                    } else {
+                        decrement_pending_bytes(&ctx.pending_bytes, original_len - filtered_len);
+                    }
+                    packet.data = data;
+                    filtered.push(packet);
+                } else {
+                    decrement_pending_bytes(&ctx.pending_bytes, original_len);
+                    if let Some(completion) = packet.completion {
+                        completion.complete();
+                    }
+                }
+            }
+            frame_batch = filtered;
+        }
+        if frame_batch.is_empty() {
+            continue;
+        }
         let (returned_writer, returned_batch, frame, frame_err) =
             match frame_batch_maybe_offload(writer, frame_batch).await {
                 Ok(result) => result,
@@ -431,12 +441,14 @@ pub async fn run_outgoing_packet_writer<W: AsyncWrite + Unpin + Send + 'static>(
     suspend_flushing: Arc<AtomicBool>,
     pending_bytes: Arc<AtomicUsize>,
     id: u64,
+    user: Option<Arc<User>>,
 ) {
     let ctx = WriterCtx {
         close_token,
         suspend_flushing,
         pending_bytes,
         id,
+        user,
     };
     let mut state = FlushState::new();
 
@@ -678,6 +690,7 @@ mod tests {
             suspend,
             Arc::new(AtomicUsize::new(0)),
             0,
+            None,
         )
         .await;
     }
@@ -695,6 +708,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicUsize::new(0)),
             0,
+            None,
         ))
     }
 
@@ -840,6 +854,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicUsize::new(0)),
             0,
+            None,
         ));
 
         let (done_tx, done_rx) = oneshot::channel();
@@ -881,6 +896,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicUsize::new(0)),
             0,
+            None,
         ));
 
         let (done_tx, mut done_rx) = oneshot::channel();

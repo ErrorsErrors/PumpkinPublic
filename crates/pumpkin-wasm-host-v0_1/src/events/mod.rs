@@ -41,6 +41,10 @@ pub struct WasmPluginEventHandler {
 }
 
 pub trait ToFromWasmEvent {
+    fn should_fire(&self) -> bool {
+        true
+    }
+
     fn to_wasm_event(&self, state: &mut PluginHostState) -> crate::pumpkin::plugin::event::Event;
 
     fn from_wasm_event(
@@ -222,6 +226,9 @@ pub(super) fn consume_world(
 impl<E: Payload + ToFromWasmEvent + Clone + 'static> EventHandler<E> for WasmPluginEventHandler {
     fn handle<'a>(&'a self, server: &'a Arc<Server>, event: &'a E) -> BoxFuture<'a, ()> {
         Box::pin(async {
+            if !event.should_fire() {
+                return;
+            }
             let event = event.clone();
             let server = server.clone();
             let handler_id = self.handler_id;
@@ -271,6 +278,9 @@ impl<E: Payload + ToFromWasmEvent + Clone + 'static> EventHandler<E> for WasmPlu
         event: &'a mut E,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async {
+            if !event.should_fire() {
+                return;
+            }
             let owned_event = event.clone();
             let server = server.clone();
             let handler_id = self.handler_id;

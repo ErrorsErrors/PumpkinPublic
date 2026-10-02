@@ -129,6 +129,10 @@ impl PluginLoader for WasmPluginLoader {
         is_wasm_signed(&wasm_bytes)
     }
 
+    fn is_guest_call_active(&self) -> bool {
+        pumpkin_plugin_runtime::is_guest_call_active()
+    }
+
     fn on_tick(&self, server: &Arc<Server>) {
         scheduler::tick(&self.task_scheduler, server);
     }

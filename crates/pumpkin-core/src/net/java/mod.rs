@@ -34,7 +34,7 @@ use pumpkin_protocol::{
         packet_decoder::TCPNetworkDecoder,
         packet_encoder::TCPNetworkEncoder,
     },
-    ser::{NetworkReadExt, NetworkWriteExt, WritingError},
+    ser::{NetworkWriteExt, WritingError},
 };
 use pumpkin_util::text::TextComponent;
 use pumpkin_util::version::JavaMinecraftVersion;
@@ -43,15 +43,13 @@ use tokio::{
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
     sync::oneshot,
 };
-use tokio::{
-    sync::mpsc::{UnboundedReceiver, UnboundedSender},
-    task::JoinHandle,
-};
+use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, warn};
 
 pub mod chunk_data;
+pub mod config;
 pub mod handshake;
 pub mod login;
 mod outgoing;
@@ -61,27 +59,27 @@ pub mod recipe_helper;
 pub mod status;
 
 pub use chunk_data::{CChunkData, ChunkLightExt};
-use outgoing::{DISCONNECT_FLUSH_TIMEOUT, OutgoingPacket, run_outgoing_packet_writer};
+#[cfg(test)]
+mod packet_tests;
 
 use arc_swap::ArcSwap;
 use pending::PendingConnection;
 
 use crate::entity::player::Player;
-use crate::net::{
-    ClientPlatform, GameProfile, MAX_PENDING_BYTES, PacketRateLimiter, PlayerConfig,
-    decrement_pending_bytes,
-};
+use crate::net::user::{Completion, OutgoingPacket, User};
+use crate::net::{ClientPlatform, GameProfile, PacketRateLimiter, PlayerConfig};
 use crate::plugin::api::events::world::chunk_send::ChunkSend;
 use crate::plugin::player::player_custom_payload::PlayerCustomPayloadEvent;
-use crate::plugin::server::packet::PacketSentEvent;
+use crate::plugin::server::packet::{
+    PacketReceivedEvent, PacketSentEvent, decode_packet, encode_packet, in_packet_callback,
+};
 use crate::{error::PumpkinError, server::Server};
+use outgoing::{DISCONNECT_FLUSH_TIMEOUT, run_outgoing_packet_writer};
 
 pub struct JavaClient {
+    pub user: Arc<User>,
     pub id: u64,
-    /// The protocol the client speaks. Play packets are always encoded/decoded as
-    /// `CURRENT_MC_VERSION`. Older clients are not admitted; the packet events are the hook
-    /// for a plugin that converts them.
-    pub version: AtomicCell<JavaMinecraftVersion>,
+    pub version: Arc<AtomicCell<JavaMinecraftVersion>>,
     /// The client's game profile information. Direct field (lock-free).
     pub gameprofile: GameProfile,
     /// The client's configuration settings. Lock-free `ArcSwap`.
@@ -89,7 +87,7 @@ pub struct JavaClient {
     /// The Address used to connect to the Server, Sent in the Handshake. Direct field.
     pub server_address: String,
     /// The current connection state of the client (e.g., Handshaking, Status, Play).
-    pub connection_state: AtomicCell<ConnectionState>,
+    pub connection_state: Arc<AtomicCell<ConnectionState>>,
     /// The client's IP address. Direct field (lock-free).
     pub address: SocketAddr,
     /// The client's brand or modpack information. Lock-free `ArcSwap`.
@@ -101,11 +99,8 @@ pub struct JavaClient {
     rt_handle: tokio::runtime::Handle,
     /// An notifier that is triggered when this client is closed.
     close_token: CancellationToken,
-    /// Per-connection FIFO of serialized packets (vanilla Netty eventLoop).
-    /// Unbounded like vanilla; `MAX_PENDING_BYTES` is the limit.
-    outgoing_packet_queue_send: UnboundedSender<OutgoingPacket>,
     outgoing_packet_queue_recv: Option<UnboundedReceiver<OutgoingPacket>>,
-    /// Tracks total buffered payload bytes in the outgoing queue.
+    /// Tracks total buffered payload bytes in the outgoing queues.
     pub pending_bytes: Arc<AtomicUsize>,
     /// The packet encoder for outgoing packets.
     network_writer: std::sync::Mutex<Option<TCPNetworkEncoder<BufWriter<OwnedWriteHalf>>>>,
@@ -131,8 +126,65 @@ pub struct JavaClient {
     pub packet_sequence: AtomicI32,
     /// Packet rate limiter for incoming client packets.
     pub packet_limiter: PacketRateLimiter,
-    /// Vanilla `suspendFlushingOnServerThread`.
     suspend_flushing: Arc<AtomicBool>,
+}
+
+pub(super) async fn filter_outgoing_packet(
+    user: &Arc<User>,
+    data: Bytes,
+    silent: bool,
+    state: Option<ConnectionState>,
+) -> Option<Bytes> {
+    if let Some(state) = state {
+        let encoder = user.encoder_state.load();
+        let login = |s| matches!(s, ConnectionState::Login | ConnectionState::Transfer);
+        if state != encoder && !(login(state) && login(encoder)) {
+            return None;
+        }
+    }
+    let packet = decode_packet(data.clone()).ok()?;
+    let original_id = packet.id;
+    let original_body = packet.payload.clone();
+    let packet = PacketSentEvent::filter(user, packet, silent).await?;
+    advance_encoder_state(user, packet.id);
+    if packet.id == original_id && packet.payload == original_body {
+        Some(data)
+    } else {
+        encode_packet(packet.id, &packet.payload).ok()
+    }
+}
+
+pub(super) fn advance_encoder_state(user: &User, packet_id: i32) {
+    use pumpkin_protocol::java::client::{
+        config::CFinishConfig, login::CLoginSuccess, play::CStartConfiguration,
+    };
+    let version = user.java_version.load();
+    let previous = user.encoder_state.load();
+    let next = match previous {
+        ConnectionState::Login | ConnectionState::Transfer
+            if packet_id == CLoginSuccess::to_id(version) =>
+        {
+            if version.supports_configuration_state() {
+                ConnectionState::Config
+            } else {
+                ConnectionState::Play
+            }
+        }
+        ConnectionState::Config if packet_id == CFinishConfig::to_id(version) => {
+            ConnectionState::Play
+        }
+        ConnectionState::Play
+            if packet_id == CStartConfiguration::to_id(version)
+                && version.supports_configuration_state() =>
+        {
+            ConnectionState::Config
+        }
+        state => state,
+    };
+    if previous != next && version.supports_configuration_state() {
+        user.expect_state(next);
+    }
+    user.encoder_state.store(next);
 }
 
 impl JavaClient {
@@ -142,9 +194,9 @@ impl JavaClient {
         gameprofile: GameProfile,
         config: PlayerConfig,
     ) -> Self {
-        let (send, recv) = tokio::sync::mpsc::unbounded_channel();
-
         Self {
+            pending_bytes: pending.user.pending_bytes.clone(),
+            user: pending.user,
             id: pending.id,
             gameprofile,
             config: ArcSwap::from_pointee(config),
@@ -154,9 +206,7 @@ impl JavaClient {
             close_token: pending.close_token,
             tasks: TaskTracker::new(),
             rt_handle: tokio::runtime::Handle::current(),
-            outgoing_packet_queue_send: send,
-            outgoing_packet_queue_recv: Some(recv),
-            pending_bytes: Arc::new(AtomicUsize::new(0)),
+            outgoing_packet_queue_recv: pending.outgoing,
             version: pending.version,
             network_writer: std::sync::Mutex::new(Some(pending.network_writer)),
             network_reader: std::sync::Mutex::new(Some(pending.network_reader)),
@@ -187,12 +237,7 @@ impl JavaClient {
 
     /// Flushes Channel even while suspended.
     pub fn flush_channel(&self) {
-        if self
-            .outgoing_packet_queue_send
-            .send(OutgoingPacket::Flush)
-            .is_err()
-            && !self.close_token.is_cancelled()
-        {
+        if self.user.enqueue(OutgoingPacket::Flush).is_err() && !self.close_token.is_cancelled() {
             warn!(
                 "Failed to queue flush for client {}: channel closed",
                 self.id
@@ -202,9 +247,11 @@ impl JavaClient {
     }
 
     pub fn set_player(&self, player: Arc<Player>) {
+        self.user.set_player(&player);
         self.player.store(Arc::new(Some(player)));
     }
 
+    #[expect(clippy::too_many_lines)]
     pub async fn progress_player_packets(&self, player: &Arc<Player>, server: &Arc<Server>) {
         let Some(mut network_reader) = self
             .network_reader
@@ -224,82 +271,106 @@ impl JavaClient {
         // Skip the immediate first tick so we don't send a keep-alive the exact millisecond they join
         keep_alive_interval.tick().await;
 
-        loop {
-            tokio::select! {
-                // KEEP-ALIVE TIMER
-                _ = keep_alive_interval.tick() => {
-                    // Check if the client has timed out on keep-alive responses or no packet activity
-                    let has_timed_out = {
-                        let pending = self
-                            .pending_keep_alives
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        pending.iter().any(|(_, send_time)| send_time.elapsed() > timeout_duration)
-                    } || (self.wait_for_keep_alive.load(Ordering::Relaxed) && self.last_keep_alive_time.load().elapsed() > timeout_duration)
-                      || (self.last_packet_time.load().elapsed() > timeout_duration);
+        'connection: loop {
+            let packet_opt = {
+                let read_packet = self.get_packet_with_reader(&mut network_reader);
+                tokio::pin!(read_packet);
+                loop {
+                    tokio::select! {
+                            _ = keep_alive_interval.tick() => {
+                            // Check if the client has timed out on keep-alive responses or no packet activity
+                            let has_timed_out = {
+                                let pending = self
+                                    .pending_keep_alives
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                pending.iter().any(|(_, send_time)| send_time.elapsed() > timeout_duration)
+                            } || (self.wait_for_keep_alive.load(Ordering::Relaxed) && self.last_keep_alive_time.load().elapsed() > timeout_duration)
+                              || (self.last_packet_time.load().elapsed() > timeout_duration);
 
-                    if has_timed_out {
-                        self.kick(pumpkin_macros::translate_cross!(translation::java::DISCONNECT_TIMEOUT, translation::bedrock::DISCONNECT_TIMEOUT)).await;
-                        break;
-                    }
+                            if has_timed_out {
+                                self.kick(pumpkin_macros::translate_cross!(translation::java::DISCONNECT_TIMEOUT, translation::bedrock::DISCONNECT_TIMEOUT)).await;
+                                break 'connection;
+                            }
 
-                    let keep_alive_id = i64::from(
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as i32,
-                    );
+                            let keep_alive_id = i64::from(
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as i32,
+                            );
 
-                    self.keep_alive_id.store(keep_alive_id);
-                    self.wait_for_keep_alive.store(true, Ordering::Relaxed);
-                    self.last_keep_alive_time.store(Instant::now());
-                    {
-                        let mut pending = self
-                            .pending_keep_alives
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        pending.push((keep_alive_id, Instant::now()));
-                        if pending.len() > 16 {
-                            pending.remove(0);
+                            self.keep_alive_id.store(keep_alive_id);
+                            self.wait_for_keep_alive.store(true, Ordering::Relaxed);
+                            self.last_keep_alive_time.store(Instant::now());
+                            {
+                                let mut pending = self
+                                    .pending_keep_alives
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                pending.push((keep_alive_id, Instant::now()));
+                                if pending.len() > 16 {
+                                    pending.remove(0);
+                                }
+                            }
+                            if self.user.encoder_state.load() == ConnectionState::Config {
+                                self.enqueue_client_packet(&pumpkin_protocol::java::client::config::CConfigKeepAlive { keep_alive_id }).await;
+                            } else {
+                                self.enqueue_client_packet(&pumpkin_protocol::java::client::play::CKeepAlive::new(keep_alive_id)).await;
+                            }
                         }
+
+                        () = self.close_token.cancelled() => {
+                            break 'connection;
+                        }
+
+                    packet = &mut read_packet => break packet,
                     }
-                    let packet = pumpkin_protocol::java::client::play::CKeepAlive::new(keep_alive_id);
-                    self.enqueue_client_packet(&packet).await;
                 }
+            };
+            let Some(packet) = packet_opt else {
+                break;
+            };
+            self.last_packet_time.store(Instant::now());
 
-                () = self.close_token.cancelled() => {
-                    break;
+            if !self.packet_limiter.check_packet() {
+                warn!(
+                    "Client {} ({}) exceeded packet rate limit (rate: {}/s)",
+                    self.id,
+                    self.gameprofile.name,
+                    self.packet_limiter.max_rate()
+                );
+                self.kick(TextComponent::text(
+                    server
+                        .advanced_config
+                        .networking
+                        .java
+                        .packet_limiter
+                        .kick_message
+                        .clone(),
+                ))
+                .await;
+                break;
+            }
+
+            let state = self.connection_state.load();
+            let Some(packet) = PacketReceivedEvent::filter(&self.user, packet).await else {
+                continue;
+            };
+            if self.is_closed() {
+                break;
+            }
+            if state == ConnectionState::Config {
+                if let Err(error) = self.handle_config_packet(server, &packet).await {
+                    self.kick(TextComponent::text(format!(
+                        "Invalid configuration packet: {error}"
+                    )))
+                    .await;
                 }
-
-                // INCOMING PACKETS
-                packet_opt = self.get_packet_with_reader(&mut network_reader) => {
-                    let Some(packet) = packet_opt else {
-                        break;
-                    };
-                    self.last_packet_time.store(Instant::now());
-
-                    if !self.packet_limiter.check_packet() {
-                        warn!(
-                            "Client {} ({}) exceeded packet rate limit (rate: {}/s)",
-                            self.id,
-                            self.gameprofile.name,
-                            self.packet_limiter.max_rate()
-                        );
-                        self.kick(TextComponent::text(
-                            server
-                                .advanced_config
-                                .networking
-                                .java
-                                .packet_limiter
-                                .kick_message
-                                .clone(),
-                        ))
-                        .await;
-                        break;
-                    }
-
-                    player.inbound_packets.push(packet);
-                }
+            } else if packet.id == SConfigurationAcknowledged::to_id(self.version.load()) {
+                self.handle_configuration_acknowledged();
+            } else {
+                player.inbound_packets.push(packet);
             }
         }
     }
@@ -398,67 +469,20 @@ impl JavaClient {
         self.try_enqueue_packet_data(packet_data);
     }
 
-    /// Outbound choke point of all enqueue/send paths. `None` when the packet must be dropped.
-    fn reserve_pending_bytes(&self, packet_data: Bytes) -> Option<(Bytes, usize)> {
-        if self.close_token.is_cancelled() {
-            return None;
-        }
-        let packet_data = self.translate_outgoing(packet_data)?;
-
-        // Reserve first, release again if it does not fit.
-        let packet_len = packet_data.len();
-        let prev_bytes = self.pending_bytes.fetch_add(packet_len, Ordering::AcqRel);
-        let new_bytes = prev_bytes.saturating_add(packet_len);
-
-        if new_bytes > MAX_PENDING_BYTES {
-            decrement_pending_bytes(&self.pending_bytes, packet_len);
-            if !self.close_token.is_cancelled() {
-                warn!(
-                    "Client {} outbound packet buffer overflow ({} bytes > {} bytes). Closing connection.",
-                    self.id, new_bytes, MAX_PENDING_BYTES
-                );
-                self.close();
-            }
-            return None;
-        }
-
-        Some((packet_data, packet_len))
-    }
-
-    /// `PacketSentEvent` for clients the multiversion plugin admitted below
-    /// `CURRENT_MC_VERSION`: it gets the 26.3 id + payload and rewrites both.
-    /// `None` when cancelled.
-    fn translate_outgoing(&self, packet_data: Bytes) -> Option<Bytes> {
-        if self.version.load() == CURRENT_MC_VERSION {
-            return Some(packet_data);
-        }
-        // TODO: packets sent before `set_player` (e.g. an `add_player` kick) go out untranslated.
-        let player = self.player.load_full();
-        let Some(player) = player.as_ref() else {
-            return Some(packet_data);
+    async fn send_and_wait(&self, data: Bytes, flushed: bool) {
+        let (completion, receiver) = oneshot::channel();
+        let packet = if flushed {
+            OutgoingPacket::flushed(data, completion)
+        } else {
+            OutgoingPacket::high_priority(data, completion)
         };
-        let Some(server) = player.world().server.upgrade() else {
-            return Some(packet_data);
-        };
-        if !server.plugin_manager.has_handlers::<PacketSentEvent>() {
-            return Some(packet_data);
+        if self.user.enqueue(packet).is_err() || in_packet_callback(&self.user) {
+            return;
         }
-
-        let mut reader = &packet_data[..];
-        let Ok(packet_id) = reader.get_var_int() else {
-            return Some(packet_data);
-        };
-        let payload = packet_data.slice(packet_data.len() - reader.len()..);
-        let mut event = PacketSentEvent::new_raw(player.clone(), packet_id.0, payload);
-        server.plugin_manager.fire_blocking(&server, &mut event);
-        if event.cancelled {
-            return None;
+        tokio::select! {
+            _ = receiver => {},
+            () = self.close_token.cancelled() => {},
         }
-
-        let mut framed = Vec::with_capacity(5 + event.payload.len());
-        framed.write_var_int(&VarInt(event.packet_id)).ok()?;
-        framed.extend_from_slice(&event.payload);
-        Some(framed.into())
     }
 
     pub fn try_enqueue_packet(&self, packet_data: Bytes) {
@@ -466,28 +490,16 @@ impl JavaClient {
     }
 
     pub fn try_enqueue_packet_data(&self, packet_data: Bytes) {
-        let Some((packet_data, packet_len)) = self.reserve_pending_bytes(packet_data) else {
-            return;
-        };
-        self.queue_outgoing(OutgoingPacket::normal(packet_data), packet_len);
+        let _ = self.user.enqueue(OutgoingPacket::normal(packet_data));
     }
 
-    /// `false` once the writer is gone. Then the connection is closed.
-    fn queue_outgoing(&self, packet: OutgoingPacket, packet_len: usize) -> bool {
-        if self.outgoing_packet_queue_send.send(packet).is_ok() {
-            return true;
-        }
-        decrement_pending_bytes(&self.pending_bytes, packet_len);
-        // It is expected that the packet will fail if closed
-        if !self.close_token.is_cancelled() {
-            warn!(
-                "Failed to add packet to the outgoing packet queue for client {}: channel closed",
-                self.id
-            );
-            // Connection to the client closed since the stream is in an unknown state
-            self.close();
-        }
-        false
+    fn try_enqueue_packet_in_state(&self, data: Bytes, state: ConnectionState) {
+        let _ = self.user.enqueue(OutgoingPacket::Data {
+            data,
+            state: Some(state),
+            silent: false,
+            completion: None,
+        });
     }
 
     pub async fn await_close_interrupt(&self) {
@@ -519,9 +531,8 @@ impl JavaClient {
         }
     }
 
-    /// Disconnect packet for the current state. `None` in handshake/status.
     fn serialize_disconnect(&self, reason: &TextComponent) -> Option<Bytes> {
-        match self.connection_state.load() {
+        match self.user.encoder_state.load() {
             ConnectionState::Login => {
                 // TextComponent implements Serialize and writes in bytes instead of String
                 let packet = CLoginDisconnect::new(
@@ -543,28 +554,23 @@ impl JavaClient {
     }
 
     pub fn try_kick(&self, reason: &TextComponent) {
-        if let Some(data) = self
-            .serialize_disconnect(reason)
-            .and_then(|data| self.translate_outgoing(data))
-        {
+        if let Some(data) = self.serialize_disconnect(reason) {
             let packet_len = data.len();
-            let _ = self.pending_bytes.fetch_add(packet_len, Ordering::AcqRel);
-            // The writer drains and flushes it after `close()`
+            self.pending_bytes.fetch_add(packet_len, Ordering::AcqRel);
             if self
-                .outgoing_packet_queue_send
+                .user
+                .outgoing
                 .send(OutgoingPacket::normal(data))
                 .is_err()
             {
-                decrement_pending_bytes(&self.pending_bytes, packet_len);
-                // Expected: the writer task is already gone.
-                debug!(
-                    "Disconnect packet for client {} dropped: outgoing packet queue closed",
-                    self.id
-                );
+                crate::net::decrement_pending_bytes(&self.pending_bytes, packet_len);
             }
         }
-        let reason_text = reason.clone().get_text();
-        warn!("Closing connection for {}: {reason_text}", self.id);
+        warn!(
+            "Closing connection for {}: {}",
+            self.id,
+            reason.clone().get_text()
+        );
         self.close();
     }
 
@@ -575,11 +581,8 @@ impl JavaClient {
     pub async fn kick_explicit(&self, reason: &TextComponent, send_packet: bool) {
         if send_packet && let Some(data) = self.serialize_disconnect(reason) {
             // Stalled peer: never flushes -> Close anyway.
-            let _ = tokio::time::timeout(
-                DISCONNECT_FLUSH_TIMEOUT,
-                self.send_and_wait(data, OutgoingPacket::flushed),
-            )
-            .await;
+            let _ = tokio::time::timeout(DISCONNECT_FLUSH_TIMEOUT, self.send_and_wait(data, true))
+                .await;
         }
         let reason_text = reason.clone().get_text();
         warn!("Closing connection for {}: {reason_text}", self.id);
@@ -590,30 +593,25 @@ impl JavaClient {
         self.send_packet_now_data(packet).await;
     }
 
-    /// Enqueue on the per-connection FIFO and wait until the writer has
-    /// `write_frame`d into the `BufWriter`. Never waits for a TCP flush.
+    /// Listener and WASM calls return after enqueueing to avoid waiting on their own callback.
     pub async fn send_packet_now_data(&self, packet: Bytes) {
-        self.send_and_wait(packet, OutgoingPacket::high_priority)
-            .await;
+        self.send_and_wait(packet, false).await;
     }
 
-    /// Enqueue and wait for the writer's completion, `Framed` or `Flushed` per `make`.
-    async fn send_and_wait(
-        &self,
-        packet: Bytes,
-        make: fn(Bytes, oneshot::Sender<()>) -> OutgoingPacket,
-    ) {
-        let Some((packet, packet_len)) = self.reserve_pending_bytes(packet) else {
-            return;
-        };
-
-        let (completion_tx, completion_rx) = oneshot::channel();
-        if !self.queue_outgoing(make(packet, completion_tx), packet_len) {
+    pub async fn send_packet_now_data_in_state(&self, packet: Bytes, state: ConnectionState) {
+        let (completion, received) = oneshot::channel();
+        if let Err(err) = self.user.enqueue(OutgoingPacket::Data {
+            data: packet,
+            state: Some(state),
+            silent: false,
+            completion: Some(Completion::Framed(completion)),
+        }) {
+            if !self.is_closed() {
+                warn!("Failed to enqueue packet for client {}: {err}", self.id);
+            }
             return;
         }
-
-        if completion_rx.await.is_err() && !self.close_token.is_cancelled() {
-            // The outgoing packet task dropped before confirming the write.
+        if !in_packet_callback(&self.user) && received.await.is_err() && !self.is_closed() {
             self.close();
         }
     }
@@ -639,19 +637,28 @@ impl JavaClient {
 
     pub fn try_send_packet<P: ClientPacket>(&self, packet: &P) {
         if let Ok(data) = self.serialize_packet(packet) {
-            self.try_enqueue_packet(data);
+            self.try_enqueue_packet_in_state(data, P::state());
         }
     }
 
     pub async fn send_packet<P: ClientPacket>(&self, packet: &P) {
         if let Ok(data) = self.serialize_packet(packet) {
-            self.send_packet_now(data).await;
+            self.send_packet_now_data_in_state(data, P::state()).await;
         }
     }
 
+    #[allow(clippy::unused_async)]
     pub async fn enqueue_client_packet<P: ClientPacket>(&self, packet: &P) {
-        if let Ok(data) = self.serialize_packet(packet) {
-            self.enqueue_packet(data).await;
+        match self.serialize_packet(packet) {
+            Ok(data) => {
+                let _ = self.user.enqueue(OutgoingPacket::Data {
+                    data,
+                    state: Some(P::state()),
+                    silent: false,
+                    completion: None,
+                });
+            }
+            Err(error) => warn!("Failed to serialize packet: {error}"),
         }
     }
 
@@ -663,15 +670,7 @@ impl JavaClient {
         Self::write_packet_for_version(packet, CURRENT_MC_VERSION, write)
     }
 
-    /// Handles an incoming packet, routing it to the appropriate handler based on the current connection state.
-    ///
-    /// This function takes a `RawPacket` and routes it to the corresponding handler based on the current connection state.
-    /// It supports the following connection states:
-    ///
-    /// - **Handshake:** Handles handshake packets.
-    /// - **Status:** Handles status request and ping packets.
-    /// - **Login/Transfer:** Handles login and transfer packets.
-    /// - **Config:** Handles configuration packets.
+    /// Runs packet listeners and writes queued packets in connection order.
     pub fn start_outgoing_packet_task(&mut self) {
         let Some(packet_receiver) = self.outgoing_packet_queue_recv.take() else {
             return;
@@ -687,6 +686,7 @@ impl JavaClient {
             return;
         };
         let id = self.id;
+        let user = self.user.clone();
         let suspend_flushing = self.suspend_flushing.clone();
         self.spawn_task(async move {
             run_outgoing_packet_writer(
@@ -696,6 +696,7 @@ impl JavaClient {
                 suspend_flushing,
                 pending_bytes,
                 id,
+                Some(user),
             )
             .await;
         });
@@ -729,18 +730,8 @@ impl JavaClient {
         // The multiversion plugin has converted older clients' packets to 26.3 by now.
         let version = CURRENT_MC_VERSION;
 
-        let mut event = crate::plugin::server::packet::PacketReceivedEvent::new(
-            player.clone(),
-            packet.id,
-            packet.payload.clone(),
-        );
-        server.plugin_manager.fire_blocking(server, &mut event);
-        if event.cancelled {
-            return Ok(());
-        }
-
-        let mut payload = &event.payload[..];
-        match event.packet_id {
+        let mut payload = &packet.payload[..];
+        match packet.id {
             id if id == SConfirmTeleport::to_id(version) => {
                 self.handle_confirm_teleport(
                     player,
@@ -1207,10 +1198,10 @@ impl JavaClient {
                 );
             }
             id if id == SConfigurationAcknowledged::to_id(version) => {
-                self.handle_configuration_acknowledged(player);
+                self.handle_configuration_acknowledged();
             }
             _ => {
-                warn!("Failed to handle player packet id {}", event.packet_id);
+                warn!("Failed to handle player packet id {}", packet.id);
             }
         }
         Ok(())

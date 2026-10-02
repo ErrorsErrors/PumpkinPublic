@@ -22,15 +22,26 @@ use pumpkin_core::plugin::server::{
 use pumpkin_wasm_host_common::state::PluginHostState;
 
 impl ToFromWasmEvent for PacketReceivedEvent {
+    fn should_fire(&self) -> bool {
+        self.player.is_some()
+    }
+
     fn to_wasm_event(&self, state: &mut PluginHostState) -> Event {
         let player_res = state
-            .add(self.player.clone())
+            .add(self.player.as_ref().expect("player packet event").clone())
             .expect("failed to add player resource");
 
-        let packet = match self.player.client.as_ref() {
+        let packet = match self
+            .player
+            .as_ref()
+            .expect("player packet event")
+            .client
+            .as_ref()
+        {
             // Typed view is 26.3
             // for older clients only valid after the multiversion plugin ran.
             ClientPlatform::Java(_) => generated_packets::deserialize_java_serverbound_packet(
+                self.state,
                 self.packet_id,
                 &self.payload,
                 pumpkin_data::packet::CURRENT_MC_VERSION,
@@ -77,20 +88,30 @@ impl ToFromWasmEvent for PacketReceivedEvent {
 }
 
 impl ToFromWasmEvent for PacketSentEvent {
+    fn should_fire(&self) -> bool {
+        self.player.is_some()
+    }
+
     fn to_wasm_event(&self, state: &mut PluginHostState) -> Event {
         let player_res = state
-            .add(self.player.clone())
+            .add(self.player.as_ref().expect("player packet event").clone())
             .expect("failed to add player resource");
 
-        let packet = match self.player.client.as_ref() {
-            ClientPlatform::Java(_) => {
-                generated_packets::clientbound_java_any_to_wit(self.packet.as_ref())
-                    .map_or(ClientboundPacket::Unknown, ClientboundPacket::Java)
-            }
-            ClientPlatform::Bedrock(_) => {
-                generated_packets::clientbound_bedrock_any_to_wit(self.packet.as_ref())
-                    .map_or(ClientboundPacket::Unknown, ClientboundPacket::Bedrock)
-            }
+        let packet = match self
+            .player
+            .as_ref()
+            .expect("player packet event")
+            .client
+            .as_ref()
+        {
+            ClientPlatform::Java(_) => generated_packets::deserialize_java_clientbound_packet(
+                self.state,
+                self.packet_id,
+                &self.payload,
+                self.version,
+            )
+            .map_or(ClientboundPacket::Unknown, ClientboundPacket::Java),
+            ClientPlatform::Bedrock(_) => ClientboundPacket::Unknown,
         };
 
         Event::PacketSentEvent(PacketSentEventData {
@@ -341,6 +362,61 @@ mod tests {
                 .resource_table
                 .get::<TextComponent>(&Resource::new_own(motd_rep))
                 .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod legacy_packet_tests {
+    use super::*;
+    use bytes::Bytes;
+    use pumpkin_core::net::user::{Edition, User};
+    use pumpkin_protocol::{ConnectionState, packet::MultiVersionJavaPacket};
+    use std::sync::Weak;
+
+    #[test]
+    fn legacy_packet_events_skip_connections_without_players() {
+        let user = User::new(
+            "127.0.0.1:25565".parse().unwrap(),
+            Edition::Java,
+            Weak::new(),
+        );
+        for phase in [
+            ConnectionState::HandShake,
+            ConnectionState::Login,
+            ConnectionState::Config,
+            ConnectionState::Play,
+        ] {
+            user.decoder_state.store(phase);
+            user.encoder_state.store(phase);
+            assert!(!PacketReceivedEvent::new(user.clone(), 0, Bytes::new()).should_fire());
+            assert!(!PacketSentEvent::new(user.clone(), 0, Bytes::new()).should_fire());
+        }
+    }
+
+    #[test]
+    fn legacy_config_packets_reject_negative_view_distance() {
+        let version = pumpkin_data::packet::CURRENT_MC_VERSION;
+        let id = pumpkin_protocol::java::server::config::SClientInformationConfig::to_id(version);
+        let mut payload = b"\x05en_us\x08\x00\x01\x00\x01\x00\x01".to_vec();
+        assert!(
+            generated_packets::deserialize_java_serverbound_packet(
+                ConnectionState::Config,
+                id,
+                &payload,
+                version
+            )
+            .is_some()
+        );
+        payload[6] = 0xff;
+        assert!(
+            generated_packets::deserialize_java_serverbound_packet(
+                ConnectionState::Config,
+                id,
+                &payload,
+                version
+            )
+            .is_none()
         );
     }
 }

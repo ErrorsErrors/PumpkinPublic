@@ -3530,11 +3530,11 @@ impl pumpkin::plugin::player::HostJavaPlayer for PluginHostState {
             .client
             .java()
             .ok_or_else(|| wasmtime::Error::msg("Not a java player"))?;
-        if let Some(bytes) = crate::generated_packets::serialize_java_packet(
+        if let Some((state, bytes)) = crate::generated_packets::serialize_java_packet_with_state(
             &packet,
             pumpkin_data::packet::CURRENT_MC_VERSION,
         ) {
-            client.send_packet_now_data(bytes).await;
+            client.send_packet_now_data_in_state(bytes, state).await;
         }
         Ok(())
     }
